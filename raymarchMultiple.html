@@ -1,0 +1,498 @@
+<html>
+  <head>
+    <title>Ray Marching Multiple Instances</title>
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1">
+    <style type="text/css">
+    </style>
+    
+    <script src="js/three.min.js"></script>
+    <script src="js/CanvasRenderer.js"></script>
+    <script src="js/Projector.js"></script>
+    <script src="js/OrbitControls.js"></script>
+    <script src="js/dat.gui.min.js"></script>
+    <script src="js/KeyboardState.js"></script>
+
+    <script id="vertexShader" type="x-shader/x-vertex">
+
+// We are given the dimensions of the shader from the CPU
+uniform vec2 shaderResolution;
+
+// We will pass these to the fragment shader
+varying vec2 fragCoord;
+varying vec2 iResolution;
+
+// Set the resolution and texture coordinates for the fragment shader.
+void main(){
+    iResolution = shaderResolution;
+    fragCoord = uv*iResolution;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+}
+
+    </script>
+
+    <script id="fragmentShader" type="x-shader/x-fragment">
+
+
+
+
+// The fragment shader is where everything happens.  This is where we set up the 
+// functions to estimate, ray march them to render them, do the lighting, and
+// manipulate the view.
+
+// Converted coordinates obtained from vertex shader
+varying vec2 fragCoord;
+varying vec2 iResolution;
+
+
+// uniforms from javascript parent program
+uniform vec3 macroCameraNormal;
+uniform bool depthShader;
+uniform bool shaderPlane;
+uniform vec3 materialColor;
+uniform float alpha;
+uniform bool morphFractal;
+uniform bool twistField;
+uniform float fractalPower;
+uniform bool YRotate;
+uniform int fieldSelect;
+uniform float iTime;
+
+// shader globals
+const int MAX_MARCHING_STEPS = 1000;
+const float MIN_DIST = 0.0;
+const float MAX_DIST = 100.0;
+const float EPSILON = 0.005;
+float stepFactor = 1.0;
+
+
+// Mandle Bulb distance field modified from:
+// http://blog.hvidtfeldts.net/index.php/2011/09/distance-estimated-3d-fractals-v-the-mandelbulb-different-de-approximations/
+
+// Many of the formula parameters had to be modified in order to work with
+// the ray-marcher of choice.
+//------------------------------------------------------------------------
+const int Iterations = 7;
+const float Bailout = 2.0;
+float mandleBulb(vec3 pos, float Power) {
+    //scale the bulb
+    pos = pos/2.0;
+
+    vec3 z = pos.xzy;
+    float dr = 1.0;
+    float r = 1.0;
+    for (int i = 0; i < Iterations ; i++) {
+        r = length(z);
+        if (r>Bailout) break;
+
+        // convert to polar coordinates
+        float theta = acos(z.z/r);
+        float phi = atan(z.y,z.x);
+        dr =  pow( r, Power-1.0)*Power*dr + 1.0;
+
+        // scale and rotate the point
+        float zr = pow( r,Power);
+        theta = theta*Power;
+        phi = phi*Power;
+
+        // convert back to cartesian coordinates
+        z = zr*vec3(sin(theta)*cos(phi), sin(phi)*sin(theta), cos(theta));
+        z+=pos;
+    }
+    return (0.4*log(r)*r/dr)*2.0;
+}
+//------------------------------------------------------------------------
+
+mat4 rotateX(float theta) {
+    float c = cos(theta);
+    float s = sin(theta);
+
+    return mat4(
+        vec4(1, 0, 0, 0),
+        vec4(0, c, -s, 0),
+        vec4(0, s, c, 0),
+        vec4(0, 0, 0, 1)
+    );
+}
+
+mat4 rotateY(float theta) {
+    float c = cos(theta);
+    float s = sin(theta);
+
+    return mat4(
+        vec4(c, 0, s, 0),
+        vec4(0, 1, 0, 0),
+        vec4(-s, 0, c, 0),
+        vec4(0, 0, 0, 1)
+    );
+}
+
+// Elementary distance fields and operations from:
+// http://www.iquilezles.org/www/articles/distfunctions/distfunctions.htm
+//------------------------------------------------------------------------
+
+// Distance from `p` to rectangle at origin with dimensions `b` 
+float sdBox( vec3 p, vec3 b )
+{
+  vec3 d = abs(p) - b;
+  return min(max(d.x,max(d.y,d.z)),0.0) + length(max(d,0.0));
+}
+
+// Distance from `p` to unit cube at origin
+float cubeSDF(vec3 p){
+    return sdBox(p, vec3(1.0,1.0,1.0));
+}
+
+// Distance from `p` to sphere at origin with radius `r`
+float sphereSDF(vec3 p, float r) {
+    return length(p) - r;
+}
+
+// Set difference between objects: `d1` - `d2`
+float opS( float d1, float d2 )
+{
+    return max(-d1,d2);
+}
+
+// Distance from `p` to capped cylinder at origin with dimensions `h`
+float sdCappedCylinder( vec3 p, vec2 h )
+{
+  vec2 d = abs(vec2(length(p.xz),p.y)) - h;
+  return min(max(d.x,d.y),0.0) + length(max(d,0.0));
+}
+
+// Twist the space about the y-axis by `factor`
+vec3 opTwist( vec3 p, float factor)
+{
+    float c = cos(factor*p.y);
+    float s = sin(factor*p.y);
+    mat2  m = mat2(c,-s,s,c);
+    vec3  q = vec3(m*p.xz,p.y);
+    return q;
+}
+
+// Distance from `p` to a torus at the origin with radius' `t`
+float sdTorus( vec3 p, vec2 t )
+{
+  vec2 q = vec2(length(p.xz)-t.x,p.y);
+  return length(q)-t.y;
+}
+
+// Add noise to the space by a `factor`
+float displacement(vec3 p, float factor){
+    return sin(factor*p.x)*sin(factor*p.y)*sin(factor*p.z);
+}
+//------------------------------------------------------------------------
+
+
+
+// Ad hoc shape created by playing around
+// Twists and scales a cube with the center removed
+float coil(vec3 p){
+    float factor = 5.0;
+
+    // twist the space
+    vec3 q = opTwist(p, factor);
+
+    // Change the height and scale of the shape as time goes on
+    float height = 2.0*abs(sin(iTime));
+    float scale = 2.1-height;
+
+    // Base shape is a cube with the center removed (via subtracting a cylinder)
+    float middle = sdCappedCylinder(q/scale, vec2(1.4,height))*scale;
+    float cube = sdBox(q/scale, vec3(1.0,height,1.0))*scale;
+    float frame = opS(middle, cube);
+
+    return frame;
+}
+
+
+// The scene that will be marched, depends on the user selection
+float sceneSDF(vec3 samplePoint) {
+
+    stepFactor = 0.1;
+
+    // constant rotation about y-axis
+    if(YRotate)
+        samplePoint = (rotateY(mod(iTime/1.5,6.28))*vec4(samplePoint, 1.0)).xyz;
+
+    // Time varying twist about the y-axis
+    if(twistField)
+        samplePoint = opTwist(samplePoint, sin(iTime));
+
+    // morphing sphere
+    if(fieldSelect == 0){
+        return sphereSDF(samplePoint, 1.0) + displacement(samplePoint,4.0*sin(iTime));
+    }
+
+    // tearing cube
+    if(fieldSelect == 1){
+        if(!twistField)
+            samplePoint = opTwist(samplePoint, sin(iTime));
+        return opS(sphereSDF(samplePoint,abs(sin(iTime))+.4), cubeSDF(samplePoint));
+    }
+
+    //coil
+    if(fieldSelect == 2){
+        return coil(samplePoint);
+    }
+
+    // expanding torus
+    if(fieldSelect == 3){
+        samplePoint = (rotateX(iTime+3.14/2.0)*vec4(samplePoint,1.0)).xyz;
+        return sdTorus(samplePoint, vec2(abs(cos(iTime)),abs(sin(iTime))));
+    }
+
+    // sphere composition
+    if(fieldSelect == 4){
+        return sdTorus(samplePoint,vec2(1.0,0.5)) + displacement(samplePoint, 20.0*sin(iTime/3.0));
+    }
+
+
+    // Static twisted torus
+    if(fieldSelect == 5){
+        samplePoint = opTwist(samplePoint, 5.0);
+        float torus = sdTorus(samplePoint, vec2(1.0,0.5));
+        return torus;
+    }
+
+    // flowing torus
+    if(fieldSelect == 6){
+        if(!twistField)
+            samplePoint = opTwist(samplePoint, sin(iTime));
+        samplePoint = opTwist(samplePoint, 5.0);
+        samplePoint = (rotateX(iTime)*vec4(samplePoint,1.0)).xyz;
+        float torus = sdTorus(samplePoint, vec2(1.0,0.5));
+        return torus;
+    }
+
+    // Mandle Bulb
+    if(fieldSelect == 7){
+        stepFactor = 1.0;
+        if(morphFractal)
+            return mandleBulb(samplePoint, 6.0*abs(sin(iTime/5.0)));
+        else
+            return mandleBulb(samplePoint, fractalPower);
+    }
+}
+
+
+// Ray-marching approach from:
+// http://jamie-wong.com/2016/07/15/ray-marching-signed-distance-functions/
+// The marcher was modified to incorporate a step factor (from 0 to 1) that 
+// can be changed depending on the type of shape to be marched.
+// A larger step will increase performance by may result in artifacts.
+
+// Marcher was also modified to also return the number of steps taken in addition
+// to the distance.  This value can be used to cheaply shade an object based on
+// the number of steps away the point in question is.
+//---------------------------------------------------------------------------------
+
+/**
+ * Return the shortest distance from the eyepoint to the scene surface along
+ * the marching direction. If no part of the surface is found between start and end,
+ * return end.
+ * 
+ * eye: the eye point, acting as the origin of the ray
+ * marchingDirection: the normalized direction to march in
+ * start: the starting distance away from the eye
+ * end: the max distance away from the ey to march before giving up
+ */
+vec2 shortestDistanceToSurface(vec3 eye, vec3 marchingDirection, float start, float end) {
+    float depth = start;
+    int numSteps = 0;
+    for (int i = 0; i < MAX_MARCHING_STEPS; i++) {
+        float dist = sceneSDF(eye + depth * marchingDirection);
+        if (dist < EPSILON) {
+            return vec2(depth,float(i));
+        }
+        depth += dist*stepFactor;
+        if (depth >= end) {
+            return vec2(end,float(numSteps));
+        }
+        numSteps++;
+    }
+    return vec2(end,float(numSteps));
+}
+            
+
+/**
+ * Return the normalized direction to march in from the eye point for a single pixel.
+ * 
+ * fieldOfView: vertical field of view in degrees
+ * size: resolution of the output image
+ * fragCoord: the x,y coordinate of the pixel in the output image
+ */
+vec3 rayDirection(float fieldOfView, vec2 size, vec2 fragCoord) {
+    vec2 xy = fragCoord - size / 2.0;
+    float z = size.y / tan(radians(fieldOfView) / 2.0);
+    return normalize(vec3(xy, -z));
+}
+
+/**
+ * Using the gradient of the SDF, estimate the normal on the surface at point p.
+ */
+vec3 estimateNormal(vec3 p) {
+    return normalize(vec3(
+        sceneSDF(vec3(p.x + EPSILON, p.y, p.z)) - sceneSDF(vec3(p.x - EPSILON, p.y, p.z)),
+        sceneSDF(vec3(p.x, p.y + EPSILON, p.z)) - sceneSDF(vec3(p.x, p.y - EPSILON, p.z)),
+        sceneSDF(vec3(p.x, p.y, p.z  + EPSILON)) - sceneSDF(vec3(p.x, p.y, p.z - EPSILON))
+    ));
+}
+
+/**
+ * Lighting contribution of a single point light source via Phong illumination.
+ * 
+ * The vec3 returned is the RGB color of the light's contribution.
+ *
+ * k_a: Ambient color
+ * k_d: Diffuse color
+ * k_s: Specular color
+ * alpha: Shininess coefficient
+ * p: position of point being lit
+ * eye: the position of the camera
+ * lightPos: the position of the light
+ * lightIntensity: color/intensity of the light
+ *
+ * See https://en.wikipedia.org/wiki/Phong_reflection_model#Description
+ */
+vec3 phongContribForLight(vec3 k_d, vec3 k_s, float alpha, vec3 p, vec3 eye,
+                          vec3 lightPos, vec3 lightIntensity) {
+    vec3 N = estimateNormal(p);
+    vec3 L = normalize(lightPos - p);
+    vec3 V = normalize(eye - p);
+    vec3 R = normalize(reflect(-L, N));
+    
+    float dotLN = dot(L, N);
+    float dotRV = dot(R, V);
+    
+    if (dotLN < 0.0) {
+        // Light not visible from this point on the surface
+        return vec3(0.0, 0.0, 0.0);
+    } 
+    
+    if (dotRV < 0.0) {
+        // Light reflection in opposite direction as viewer, apply only diffuse
+        // component
+        return lightIntensity * (k_d * dotLN);
+    }
+    return lightIntensity * (k_d * dotLN + k_s * pow(dotRV, alpha));
+}
+
+/**
+ * Lighting via Phong illumination.
+ * 
+ * The vec3 returned is the RGB color of that point after lighting is applied.
+ * k_a: Ambient color
+ * k_d: Diffuse color
+ * k_s: Specular color
+ * alpha: Shininess coefficient
+ * p: position of point being lit
+ * eye: the position of the camera
+ *
+ * See https://en.wikipedia.org/wiki/Phong_reflection_model#Description
+ */
+vec3 phongIllumination(vec3 k_a, vec3 k_d, vec3 k_s, float alpha, vec3 p, vec3 eye) {
+    const vec3 ambientLight = 0.5 * vec3(1.0, 1.0, 1.0);
+    vec3 color = ambientLight * k_a;
+    
+    vec3 light1Pos = vec3(4.0,2.0,4.0);
+    vec3 light1Intensity = vec3(0.4, 0.4, 0.4);
+    
+    color += phongContribForLight(k_d, k_s, alpha, p, eye,
+                                  light1Pos,
+                                  light1Intensity);
+    
+
+    vec3 light2Pos = vec3(2.0,2.0,2.0);
+    vec3 light2Intensity = vec3(0.4, 0.4, 0.4);
+    
+    color += phongContribForLight(k_d, k_s, alpha, p, eye,
+                                  light2Pos,
+                                  light2Intensity);    
+    return color;
+}
+
+/**
+ * Return a transform matrix that will transform a ray from view space
+ * to world coordinates, given the eye point, the camera target, and an up vector.
+ *
+ * This assumes that the center of the camera is aligned with the negative z axis in
+ * view space when calculating the ray marching direction. See rayDirection.
+ */
+mat4 viewMatrix_(vec3 eye, vec3 center, vec3 up) {
+    // Based on gluLookAt man page
+    vec3 f = normalize(center - eye);
+    vec3 s = normalize(cross(f, up));
+    vec3 u = cross(s, f);
+    return mat4(
+        vec4(s, 0.0),
+        vec4(u, 0.0),
+        vec4(-f, 0.0),
+        vec4(0.0, 0.0, 0.0, 1)
+    );
+}
+//---------------------------------------------------------------------------------
+
+
+
+
+
+void main()
+{
+
+    // Set up the eye (origin of the ray), view direction, FOV.
+    vec3 viewDir = rayDirection(45.0, iResolution.xy, fragCoord);
+    vec3 eye = vec3(10.0,10.0,10.0);
+    eye = length(eye)*normalize(macroCameraNormal);
+    
+
+    mat4 viewToWorld = viewMatrix_(eye, vec3(0.0), vec3(0.0, 1.0, 0.0));
+    
+    vec3 worldDir = (viewToWorld * vec4(viewDir, 0.0)).xyz;
+    
+    // March the ray into the scene based on the scene distance function.
+    vec2 result = shortestDistanceToSurface(eye, worldDir, MIN_DIST, MAX_DIST);
+    float dist = result.x;
+    float numSteps = result.y;
+
+    if (dist > MAX_DIST - EPSILON) {
+        // Didn't hit anything
+        gl_FragColor = vec4(0.0, 0.0, 0.0, float(shaderPlane));
+        return;
+    }
+    
+    // The closest point on the surface to the eyepoint along the view ray
+    vec3 p = eye + dist * worldDir;
+
+    // Phong parameters
+    vec3 K_a = materialColor;
+    vec3 K_d = 0.7*K_a;
+    vec3 K_s = vec3(1.0, 1.0, 1.0);
+    float shininess = 10.0;
+    
+    // Use the cheap shading based on number of steps
+    // Only applies to the mandlebulb since the other shapes are too far away and appear black
+    if(depthShader && fieldSelect == 7){
+        float depthColor = 1.0 - numSteps/float(MAX_DIST);
+        gl_FragColor = vec4(depthColor*materialColor,alpha);
+    }
+    else{ // Phong illumination
+        vec3 color = phongIllumination(K_a, K_d, K_s, shininess, p, eye);
+        gl_FragColor = vec4(color, alpha);
+    }
+    
+
+}
+
+
+    </script>
+
+
+  </head>
+
+  <body>
+    <div id="canvas" style="width:auto; margin: 0 auto;">
+        <script src="raymarchMultiple.js"> </script>
+    </div>
+</body>
+</html>
